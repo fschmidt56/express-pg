@@ -1,65 +1,107 @@
 "use strict";
-var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
-    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
-    return new (P || (P = Promise))(function (resolve, reject) {
-        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
-        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
-        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
-        step((generator = generator.apply(thisArg, _arguments || [])).next());
-    });
-};
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
-const pg_1 = require("pg");
-const node_fetch_1 = __importDefault(require("node-fetch"));
-const apiUrl = 'https://api.openrouteservice.org/v2/directions/foot-walking/geojson';
-const apiKey = '5b3ce3597851110001cf6248651568a78b4e48489463497db3fddbc7';
-const headers = {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Accept': 'application/json, application/geo+json, application/gpx+xml, img/png; charset=utf-8',
-    'Authorization': apiKey
-};
-let startCoord = [7.036400, 50.968590];
-let endCoord = [7.036400, 50.968590];
+const utils_1 = require("./utils/utils");
+const config_1 = require("./config/config");
 let body;
-exports.pool = new pg_1.Pool({
-    user: 'postgres',
-    host: 'localhost',
-    database: 'test',
-    password: 'postgres',
-    port: 5432
-});
-// Example POST method implementation:
-function postData(url, data) {
-    return __awaiter(this, void 0, void 0, function* () {
-        const response = yield node_fetch_1.default(url, {
-            method: 'POST',
-            headers: headers,
-            body: JSON.stringify(data)
-        });
-        return yield response.json(); // parses JSON response into native JavaScript objects
-    });
-}
+let bboxData;
+let radiusData;
+let lineData;
+let numberOfBars;
 exports.getLocations = (request, response) => {
-    exports.pool.query(`SELECT ST_X(ST_TRANSFORM(geometry,4326)) as long, 
-                ST_Y(ST_TRANSFORM(geometry,4326)) as lat 
-                FROM nabu.home 
-                ORDER BY RANDOM() 
-                LIMIT 5`, (error, results) => {
+    numberOfBars = request.body.bars;
+    let budget = request.body.budget;
+    let radius = request.body.radius;
+    let center = request.body.center;
+    let startCoords = request.body.startPoint;
+    let endCoords = request.body.endPoint;
+    let extent = request.body.extent;
+    const lineQuery = `SELECT ST_X(ST_TRANSFORM(geom, 4326)) as long, ST_Y(ST_TRANSFORM(geom, 4326)) as lat, gastro, bier, preis FROM (SELECT geom, gastro, bier, preis, sum(preis) OVER (ORDER BY RANDOM()) AS total_sum FROM bier.koelsch_test WHERE ST_DWithin(ST_BUFFER(ST_MAKELINE(ST_Transform(ST_SetSRID(ST_MAKEPOINT(${startCoords}),4326),3857), ST_Transform(ST_SetSRID(ST_MAKEPOINT(${endCoords}), 4326),3857)), 250), ST_SetSRID(geom,3857), 500)) t WHERE total_sum <= ${budget} ORDER BY geom LIMIT ${numberOfBars};`;
+    const bboxQuery = `SELECT ST_X(ST_TRANSFORM(geom, 4326)) as long, ST_Y(ST_TRANSFORM(geom, 4326)) as lat, gastro, bier, preis FROM (SELECT geom, gastro, bier, preis, sum(preis) OVER (ORDER BY RANDOM()) AS total_sum FROM bier.koelsch_test AS a WHERE ST_Contains(ST_Transform(ST_MakeEnvelope(${extent}, 4326), 3857), a.geom)ORDER BY RANDOM()) t WHERE total_sum <= ${budget} ORDER BY geom LIMIT ${numberOfBars};`;
+    const radiusQuery = `SELECT ST_X(ST_TRANSFORM(geom, 4326)) as long, ST_Y(ST_TRANSFORM(geom, 4326)) as lat, gastro, bier, preis FROM (SELECT geom, gastro, bier, preis, sum(preis) OVER (ORDER BY RANDOM()) AS total_sum FROM bier.koelsch_test WHERE ST_DWithin(ST_Transform(ST_SetSRID(ST_Point(${center}), 4326), 3857), ST_Transform(geom, 3857), 3000)) t WHERE total_sum <= ${budget} ORDER BY geom LIMIT ${numberOfBars};`;
+    config_1.pool.query(lineQuery, (error, results) => {
         if (error) {
             throw error;
         }
         let coordsArr = [];
-        const data = results.rows;
-        for (let i = 0; i < data.length; i++) {
-            let tempArr = [data[i].long, data[i].lat];
-            coordsArr.push(tempArr);
+        lineData = results.rows;
+        if (lineData.length < numberOfBars) {
+            console.log('Calculating route with LineBuffer not possible. Trying calculating alternative route with BoundingBox...');
+            config_1.pool.query(bboxQuery, (error, results) => {
+                if (error) {
+                    throw error;
+                }
+                bboxData = results.rows;
+                if (bboxData.length < numberOfBars) {
+                    console.log('Calculating route with BoundingBox not possible. Trying calculating alternative route with radius...');
+                    config_1.pool.query(radiusQuery, (error, results) => {
+                        if (error) {
+                            throw error;
+                        }
+                        radiusData = results.rows;
+                        if (radiusData.length < numberOfBars) {
+                            console.log('Calculating route for given parameters not possible. Change your parameters.');
+                        }
+                        else {
+                            console.log('Calculating route with radius successful.');
+                            utils_1.createGeoJson(radiusData);
+                            for (let i = 0; i < radiusData.length; i++) {
+                                let tempArr = [radiusData[i].long, radiusData[i].lat];
+                                coordsArr.push(tempArr);
+                            }
+                            body = {
+                                "coordinates": [startCoords, ...coordsArr, endCoords],
+                                //"instructions": false,
+                                "preference": "shortest"
+                            };
+                            utils_1.postData(config_1.apiUrl, body)
+                                .then((data) => response.status(200).json(data))
+                                .catch((error) => error);
+                        }
+                    });
+                }
+                else {
+                    console.log('Calculating route with BoundingBox successful.');
+                    utils_1.createGeoJson(bboxData);
+                    for (let i = 0; i < bboxData.length; i++) {
+                        let tempArr = [bboxData[i].long, bboxData[i].lat];
+                        coordsArr.push(tempArr);
+                    }
+                    body = {
+                        "coordinates": [startCoords, ...coordsArr, endCoords],
+                        //"instructions": false,
+                        "preference": "shortest"
+                    };
+                    utils_1.postData(config_1.apiUrl, body)
+                        .then((data) => response.status(200).json(data))
+                        .catch((error) => error);
+                }
+            });
         }
-        body = { "coordinates": [startCoord, ...coordsArr, endCoord] };
-        postData(apiUrl, body)
-            .then((data) => response.status(200).json(data))
-            .catch((error) => error);
+        else {
+            console.log('Calculating route with LineBuffer successful.');
+            utils_1.createGeoJson(lineData);
+            for (let i = 0; i < lineData.length; i++) {
+                let tempArr = [lineData[i].long, lineData[i].lat];
+                coordsArr.push(tempArr);
+            }
+            body = {
+                "coordinates": [startCoords, ...coordsArr, endCoords],
+                //"instructions": false,
+                "preference": "shortest"
+            };
+            utils_1.postData(config_1.apiUrl, body)
+                .then((data) => response.status(200).json(data))
+                .catch((error) => error);
+        }
     });
+};
+exports.getGeoJson = (request, response) => {
+    if (lineData.length == numberOfBars) {
+        response.status(200).json(utils_1.createGeoJson(lineData));
+    }
+    else if (bboxData.length == numberOfBars || radiusData.length == numberOfBars) {
+        bboxData.length == numberOfBars ? response.status(200).json(utils_1.createGeoJson(bboxData)) : response.status(200).json(utils_1.createGeoJson(radiusData));
+    }
+    else
+        (response.json('No geojson created yet.'));
 };
